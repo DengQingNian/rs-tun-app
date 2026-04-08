@@ -4,3 +4,5 @@
 # Configuration files (use .example files for reference)
 /server.toml
 /client.toml
+
+.opencode/
