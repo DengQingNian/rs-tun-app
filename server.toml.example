@@ -1,0 +1,14 @@
+# Server Configuration
+
+# Bind address and port
+bind_addr = "0.0.0.0"
+bind_port = 20264
+
+# Secret key for checksum validation (must match client)
+secret = "your-secret-key"
+
+# Heartbeat interval in seconds (client will send heartbeat every this interval)
+heartbeat_interval_secs = 10
+
+# Client timeout in seconds (remove client from registry if no heartbeat)
+client_timeout_secs = 30

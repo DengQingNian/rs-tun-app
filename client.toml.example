@@ -1,0 +1,19 @@
+# Client Configuration
+
+# Server address and port
+server_addr = "127.0.0.1"
+server_port = 20264
+
+# TUN device IP and netmask
+tun_ip = "10.0.3.5"
+tun_netmask = 24
+
+# Secret key for checksum validation (must match server)
+secret = "your-secret-key"
+
+# Reconnection settings
+reconnect_delay_secs = 3
+max_reconnect_attempts = 0  # 0 = infinite retries
+
+# Heartbeat interval in seconds
+heartbeat_interval_secs = 5
