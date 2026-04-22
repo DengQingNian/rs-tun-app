@@ -17,9 +17,10 @@
 //! - Differentiates between control messages (heartbeats) and data traffic
 //!
 //! **Why two checksum algorithms?**
-//! - Heartbeat frames use CRC32 with a secret token for authentication
-//! - Data frames use a simple checksum for performance (hot path)
-//! This balances security for control messages with throughput for data.
+//!   - Heartbeat frames use CRC32 with a secret token for authentication
+//!   - Data frames use a simple checksum for performance (hot path)
+//!
+//!   This balances security for control messages with throughput for data.
 //!
 //! ## Frame Format
 //!
@@ -637,6 +638,86 @@ pub fn parse_frame(bytes: &[u8]) -> Result<(PackageFrame, &[u8]), Error> {
 }
 
 // ============================================================================
+// CHECKSUM CALCULATION FUNCTIONS
+// ============================================================================
+
+/// Calculate checksum for heartbeat frames (with authentication).
+///
+/// # Why
+/// Heartbeat frames need stronger integrity verification because they carry
+/// client registration information. The secret is included in the calculation
+/// to prevent forging heartbeats without knowing the secret.
+///
+/// # How
+/// Uses CRC32 algorithm which provides:
+///   - Stronger collision resistance than simple sum
+///   - The secret is incorporated into the hash, creating authentication
+///
+/// Result is truncated to 16 bits for the protocol format.
+fn sum(kind: &FrameType, data: &Bytes, token: &str) -> u16 {
+    let mut hasher = Crc32::new();
+
+    // Include frame type in checksum (different types = different checksum)
+    hasher.update(match kind {
+        FrameType::Heartbeat => &[1u8],
+        FrameType::Data => &[2u8],
+    });
+
+    // Include data length (prevents length extension attacks)
+    hasher.update(&(data.len() as u32).to_be_bytes());
+
+    // Include actual data
+    hasher.update(data);
+
+    // Include secret token (provides authentication)
+    hasher.update(token.as_bytes());
+
+    // Truncate to 16 bits for protocol
+    (hasher.finalize() & 0xFFFF) as u16
+}
+
+/// Calculate checksum for data frames (simple, fast).
+///
+/// # Why
+/// Data frames are the "hot path" - every tunneled packet goes through this.
+/// A simple checksum provides adequate integrity checking with minimal overhead.
+/// CRC32 would work but is slower for this use case.
+///
+/// # How
+/// Computes a simple sum:
+/// - Iterates through data in 4-byte chunks, summing as u32 (little-endian)
+/// - Handles remaining 1-3 bytes individually
+/// - Uses wrapping add to handle overflow (matches UDP/IP checksum behavior)
+/// - Truncates to 16 bits
+fn simple_sum(data: &Bytes) -> u16 {
+    let len = data.len();
+    if len == 0 {
+        return 0;
+    }
+    let mut s: u32 = 0;
+    let mut i = 0;
+
+    // Process 4-byte chunks (faster than byte-by-byte)
+    while i + 4 <= len {
+        s = s.wrapping_add(u32::from_le_bytes([
+            data[i],
+            data[i + 1],
+            data[i + 2],
+            data[i + 3],
+        ]));
+        i += 4;
+    }
+
+    // Handle remaining bytes (1-3 bytes)
+    while i < len {
+        s = s.wrapping_add(data[i] as u32);
+        i += 1;
+    }
+
+    (s & 0xFFFF) as u16
+}
+
+// ============================================================================
 // TESTS - Protocol Verification
 // ============================================================================
 
@@ -821,7 +902,7 @@ mod tests {
     fn test_parse_sticky_packets_multiple_clients() {
         let frame_client1 = PackageFrame::new(
             FrameType::Data,
-            Bytes::copy_from_slice(&vec![
+            Bytes::copy_from_slice(&[
                 0x45, 0x00, 0x00, 0x1c, 0x00, 0x01, 0x00, 0x00, 0x40, 0x06, 0xb1, 0xe6, 0xac, 0x0a,
                 0x03, 0x02, 0xac, 0x0a, 0x03, 0x03,
             ]),
@@ -829,7 +910,7 @@ mod tests {
 
         let frame_client2 = PackageFrame::new(
             FrameType::Data,
-            Bytes::copy_from_slice(&vec![
+            Bytes::copy_from_slice(&[
                 0x45, 0x00, 0x00, 0x1c, 0x00, 0x01, 0x00, 0x00, 0x40, 0x06, 0xb1, 0xe6, 0xac, 0x0a,
                 0x03, 0x03, 0xac, 0x0a, 0x03, 0x02,
             ]),
@@ -845,7 +926,7 @@ mod tests {
         assert_eq!(dst1, Some(Ipv4Addr::new(172, 10, 3, 3).to_bits()));
 
         // Parse second frame from remaining
-        let (parsed2, _) = parse_frame(&remaining).unwrap();
+        let (parsed2, _) = parse_frame(remaining).unwrap();
         let dst2 = parsed2.get_dst_ip();
         assert_eq!(dst2, Some(Ipv4Addr::new(172, 10, 3, 2).to_bits()));
     }
@@ -870,10 +951,7 @@ mod tests {
     // Test: Checksum is validated during parsing
     #[test]
     fn test_checksum_in_validation() {
-        let frame = PackageFrame::new(
-            FrameType::Data,
-            Bytes::copy_from_slice(&vec![1, 2, 3, 4, 5]),
-        );
+        let frame = PackageFrame::new(FrameType::Data, Bytes::copy_from_slice(&[1, 2, 3, 4, 5]));
 
         let bytes = frame.to_bytes();
 
@@ -909,83 +987,4 @@ mod tests {
         let parsed = PackageFrame::from_bytes_with_secret(&bytes, "test_secret").unwrap();
         assert_eq!(parsed.get_heartbeat_ip(), Some(client_ip.to_bits()));
     }
-}
-
-// ============================================================================
-// CHECKSUM CALCULATION FUNCTIONS
-// ============================================================================
-
-/// Calculate checksum for heartbeat frames (with authentication).
-///
-/// # Why
-/// Heartbeat frames need stronger integrity verification because they carry
-/// client registration information. The secret is included in the calculation
-/// to prevent forging heartbeats without knowing the secret.
-///
-/// # How
-/// Uses CRC32 algorithm which provides:
-/// - Stronger collision resistance than simple sum
-/// - The secret is incorporated into the hash, creating authentication
-/// Result is truncated to 16 bits for the protocol format.
-fn sum(kind: &FrameType, data: &Bytes, token: &str) -> u16 {
-    let mut hasher = Crc32::new();
-
-    // Include frame type in checksum (different types = different checksum)
-    hasher.update(match kind {
-        FrameType::Heartbeat => &[1u8],
-        FrameType::Data => &[2u8],
-    });
-
-    // Include data length (prevents length extension attacks)
-    hasher.update(&(data.len() as u32).to_be_bytes());
-
-    // Include actual data
-    hasher.update(data);
-
-    // Include secret token (provides authentication)
-    hasher.update(token.as_bytes());
-
-    // Truncate to 16 bits for protocol
-    (hasher.finalize() & 0xFFFF) as u16
-}
-
-/// Calculate checksum for data frames (simple, fast).
-///
-/// # Why
-/// Data frames are the "hot path" - every tunneled packet goes through this.
-/// A simple checksum provides adequate integrity checking with minimal overhead.
-/// CRC32 would work but is slower for this use case.
-///
-/// # How
-/// Computes a simple sum:
-/// - Iterates through data in 4-byte chunks, summing as u32 (little-endian)
-/// - Handles remaining 1-3 bytes individually
-/// - Uses wrapping add to handle overflow (matches UDP/IP checksum behavior)
-/// - Truncates to 16 bits
-fn simple_sum(data: &Bytes) -> u16 {
-    let len = data.len();
-    if len == 0 {
-        return 0;
-    }
-    let mut s: u32 = 0;
-    let mut i = 0;
-
-    // Process 4-byte chunks (faster than byte-by-byte)
-    while i + 4 <= len {
-        s = s.wrapping_add(u32::from_le_bytes([
-            data[i],
-            data[i + 1],
-            data[i + 2],
-            data[i + 3],
-        ]));
-        i += 4;
-    }
-
-    // Handle remaining bytes (1-3 bytes)
-    while i < len {
-        s = s.wrapping_add(data[i] as u32);
-        i += 1;
-    }
-
-    (s & 0xFFFF) as u16
 }

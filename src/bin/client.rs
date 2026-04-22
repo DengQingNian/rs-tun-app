@@ -31,9 +31,9 @@
 use bytes::Bytes;
 use rusttun::shared::config::ClientConfig;
 use rusttun::shared::data::{FrameType, PackageFrame};
+use std::io::ErrorKind;
 use std::net::Ipv4Addr;
 use std::time::Duration;
-use std::io::ErrorKind;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -41,23 +41,22 @@ use tokio::time::{sleep, timeout};
 use tun_rs::DeviceBuilder;
 
 /// Maximum buffer size to prevent memory exhaustion.
-/// 
+///
 /// HOW: If server sends data faster than we can process it, buffer grows.
 /// This limit prevents a malicious server from consuming all client memory.
 const MAX_BUFFER_SIZE: usize = 1024 * 1024;
 
 /// Buffer size for reading from TUN interface.
-/// 
+///
 /// HOW: TUN packets can be up to 65536 bytes (IPv4 max).
 /// Using 64KB buffer handles most real-world packets.
 const TUN_READ_BUF_SIZE: usize = 65536;
 
 /// Batch size for writing to TUN interface.
-/// 
+///
 /// HOW: When receiving multiple packets from server, batch them together
 /// to reduce TUN write syscalls. Balance between latency and throughput.
 const TUN_WRITE_BATCH_SIZE: usize = 64;
-
 
 /// Client entry point with reconnection logic.
 ///
@@ -98,27 +97,31 @@ async fn main() {
     // Step 2: Reconnection loop
     loop {
         attempt += 1;
-        
+
         // Check if we've exceeded max attempts (0 = infinite)
         if config.max_reconnect_attempts > 0 && attempt > config.max_reconnect_attempts {
             break;
         }
 
-        println!("[Attempt {}] Connecting to server {}...", attempt, server_addr);
+        println!(
+            "[Attempt {}] Connecting to server {}...",
+            attempt, server_addr
+        );
 
         // Step 3: Attempt client session
         match run_client(&config, &server_addr).await {
             Ok(_) => break,
             Err(e) => {
                 // Step 4: Handle connection failure
-                println!("[Attempt {}] Connection failed: {}. Reconnecting in {}s...",
-                    attempt, e, config.reconnect_delay_secs);
+                println!(
+                    "[Attempt {}] Connection failed: {}. Reconnecting in {}s...",
+                    attempt, e, config.reconnect_delay_secs
+                );
                 sleep(Duration::from_secs(config.reconnect_delay_secs)).await;
             }
         }
     }
 }
-
 
 /// Run a single client session.
 ///
@@ -152,7 +155,9 @@ async fn run_client(config: &ClientConfig, server_addr: &str) -> Result<(), Stri
 
     // Step 2: Create TUN interface
     let tun_ip = config.tun_ip_addr();
-    let tun = create_tun_device(tun_ip, config.tun_netmask).await.map_err(|e| e.to_string())?;
+    let tun = create_tun_device(tun_ip, config.tun_netmask)
+        .await
+        .map_err(|e| e.to_string())?;
 
     // Step 3: Split TCP stream
     let (r, w) = stream.into_split();
@@ -185,7 +190,7 @@ async fn run_client(config: &ClientConfig, server_addr: &str) -> Result<(), Stri
     let mut w = w;
     let sender_handle = tokio::spawn(async move {
         let mut rx = rx;
-        
+
         loop {
             tokio::select! {
                 data = rx.recv() => {
@@ -208,7 +213,7 @@ async fn run_client(config: &ClientConfig, server_addr: &str) -> Result<(), Stri
     let mut r = r;
     let receiver_handle = tokio::spawn(async move {
         let mut buffer = Vec::with_capacity(65536);
-        
+
         // Read loop with timeout for non-blocking checks
         loop {
             let mut tmp_buffer = vec![0u8; 65536];
@@ -218,7 +223,7 @@ async fn run_client(config: &ClientConfig, server_addr: &str) -> Result<(), Stri
                         break;
                     }
                     buffer.extend_from_slice(&tmp_buffer[..n]);
-                    
+
                     // Security: limit buffer size
                     if buffer.len() > MAX_BUFFER_SIZE {
                         buffer.clear();
@@ -266,7 +271,6 @@ async fn run_client(config: &ClientConfig, server_addr: &str) -> Result<(), Stri
     Err("Connection lost".to_string())
 }
 
-
 /// Create and configure a TUN interface.
 ///
 /// # Arguments
@@ -281,7 +285,10 @@ async fn run_client(config: &ClientConfig, server_addr: &str) -> Result<(), Stri
 /// 2. Try to create new TUN device
 /// 3. If name conflict, try to open existing device
 /// 4. If already in use, return appropriate error
-async fn create_tun_device(tun_ip: Ipv4Addr, tun_netmask: u8) -> Result<tun_rs::AsyncDevice, String> {
+async fn create_tun_device(
+    tun_ip: Ipv4Addr,
+    tun_netmask: u8,
+) -> Result<tun_rs::AsyncDevice, String> {
     // Generate name from IP: rs-tun-{third_octet}
     let name = format!("rs-tun-{}", tun_ip.octets()[2]);
 
@@ -314,7 +321,6 @@ async fn create_tun_device(tun_ip: Ipv4Addr, tun_netmask: u8) -> Result<tun_rs::
     }
 }
 
-
 /// Heartbeat sending task.
 ///
 /// # Why
@@ -326,7 +332,12 @@ async fn create_tun_device(tun_ip: Ipv4Addr, tun_netmask: u8) -> Result<tun_rs::
 /// # How
 /// Runs in an infinite loop, sending heartbeat at configured interval.
 /// Exits when the channel is closed (client disconnecting).
-async fn heartbeat_thread(tx: mpsc::Sender<Bytes>, tun_ip: Ipv4Addr, interval_secs: u64, secret: &str) {
+async fn heartbeat_thread(
+    tx: mpsc::Sender<Bytes>,
+    tun_ip: Ipv4Addr,
+    interval_secs: u64,
+    secret: &str,
+) {
     loop {
         // Create heartbeat frame with client's TUN IP
         let frame = PackageFrame::new_heartbeat(tun_ip.to_bits(), secret);
@@ -341,7 +352,6 @@ async fn heartbeat_thread(tx: mpsc::Sender<Bytes>, tun_ip: Ipv4Addr, interval_se
         sleep(Duration::from_secs(interval_secs)).await;
     }
 }
-
 
 /// TUN interface handler.
 ///
@@ -396,13 +406,13 @@ async fn tun_handler(
                     Err(_) => break,
                 }
             }
-            
+
             // Receive packets from server
             data = tun_write_rx.recv() => {
                 match data {
                     Some(d) => {
                         write_batch.push(d);
-                        
+
                         // Batch write when full or deadline reached
                         let now = tokio::time::Instant::now();
                         if write_batch.len() >= TUN_WRITE_BATCH_SIZE || now >= batch_deadline {
@@ -424,7 +434,7 @@ async fn tun_handler(
                     }
                 }
             }
-            
+
             // Batch write deadline timer
             _ = tokio::time::sleep_until(batch_deadline), if !write_batch.is_empty() => {
                 for pkt in write_batch.drain(..) {

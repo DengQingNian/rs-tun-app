@@ -38,7 +38,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
 /// Maximum buffer size to prevent memory exhaustion attacks.
-/// 
+///
 /// WHY: If a client sends data faster than we can process it, the buffer grows
 /// unbounded. This limit prevents a malicious or buggy client from consuming
 /// all server memory.
@@ -54,11 +54,10 @@ struct ClientInfo {
 }
 
 /// Type alias for the client registry.
-/// 
+///
 /// WHY: The registry maps a client's TUN IP address to their connection metadata.
 /// This enables O(1) lookup for packet routing.
 type ClientRegistry = Arc<Mutex<HashMap<Ipv4Addr, ClientInfo>>>;
-
 
 /// Server entry point.
 ///
@@ -106,11 +105,11 @@ async fn main() {
                     // Disable Nagle's algorithm for lower latency
                     // WHY: We want each frame to be sent immediately without buffering
                     socket.set_nodelay(true).ok();
-                    
+
                     // Clone references for the new client task
                     let clients_clone = clients.clone();
                     let secret_clone = secret.clone();
-                    
+
                     // Spawn async handler for this client
                     // WHY: Each client gets its own task - they run concurrently
                     tokio::spawn(on_client_accepted(socket, clients_clone, secret_clone));
@@ -126,7 +125,6 @@ async fn main() {
     }
 }
 
-
 /// Handle a newly accepted client connection.
 ///
 /// # Arguments
@@ -139,11 +137,7 @@ async fn main() {
 /// 2. Split socket into read and write halves
 /// 3. Wrap writer in Arc<Mutex> for shared access
 /// 4. Start the read loop
-async fn on_client_accepted(
-    socket: TcpStream,
-    clients: ClientRegistry,
-    secret: String,
-) {
+async fn on_client_accepted(socket: TcpStream, clients: ClientRegistry, secret: String) {
     // Log client connection for debugging
     let addr = socket.peer_addr().unwrap();
     println!("Client connected: {}", addr);
@@ -151,15 +145,14 @@ async fn on_client_accepted(
     // Split into read and write halves
     // WHY: We need independent access to read and write - they're used in different contexts
     let (r, w) = socket.into_split();
-    
+
     // Wrap writer in Mutex for shared access (registry holds this)
     // WHY: The registry is shared, so the writer needs to be thread-safe
     let writer_arc = Arc::new(Mutex::new(w));
-    
+
     // Start reading frames from this client
     read_loop(r, writer_arc, clients, secret).await
 }
-
 
 /// Main read loop for processing client frames.
 ///
@@ -183,11 +176,11 @@ async fn read_loop(
     // Wrap in BufReader for efficient reading
     // WHY: Reduces syscalls by buffering data internally
     let mut reader = BufReader::new(r);
-    
+
     // Accumulate received data
     // WHY: TCP is a stream - data may arrive fragmented or combined
     let mut buffer = Vec::with_capacity(65536);
-    
+
     // Track this client's registered IP
     let mut client_ip: Option<Ipv4Addr> = None;
 
@@ -203,7 +196,7 @@ async fn read_loop(
             Ok(n) => {
                 // Add new data to buffer
                 buffer.extend_from_slice(&tmp_buffer[..n]);
-                
+
                 // Security: prevent buffer overflow attacks
                 if buffer.len() > MAX_BUFFER_SIZE {
                     buffer.clear();
@@ -229,7 +222,7 @@ async fn read_loop(
                             // Registration frame - extract client IP
                             if let Some(reg_ip) = frame.get_heartbeat_ip() {
                                 let client_ip_addr = Ipv4Addr::from_bits(reg_ip);
-                                
+
                                 // First heartbeat from this client - register them
                                 if client_ip.is_none() {
                                     client_ip = Some(client_ip_addr);
@@ -245,27 +238,27 @@ async fn read_loop(
                         }
                         FrameType::Data => {
                             // Data frame - forward to destination client
-                            
+
                             // First data frame may carry registration IP too
                             // HOW: Extract source IP from IP packet header
-                            if client_ip.is_none() {
-                                if let Some(src_ip) = extract_src_ip(&frame.data) {
-                                    client_ip = Some(src_ip);
-                                    let mut client_map = clients.lock().await;
-                                    client_map.insert(
-                                        src_ip,
-                                        ClientInfo {
-                                            writer: writer.clone(),
-                                        },
-                                    );
-                                }
+                            if client_ip.is_none()
+                                && let Some(src_ip) = extract_src_ip(&frame.data)
+                            {
+                                client_ip = Some(src_ip);
+                                let mut client_map = clients.lock().await;
+                                client_map.insert(
+                                    src_ip,
+                                    ClientInfo {
+                                        writer: writer.clone(),
+                                    },
+                                );
                             }
 
                             // Route packet to destination client based on dst IP
                             if let Some(dst_ip) = frame.get_dst_ip() {
                                 let dst = Ipv4Addr::from_bits(dst_ip);
                                 let frame_bytes = frame.to_bytes();
-                                
+
                                 // Lookup destination client in registry
                                 let client_map = clients.lock().await;
                                 if let Some(client_info) = client_map.get(&dst) {
@@ -296,7 +289,6 @@ async fn read_loop(
         clients.lock().await.remove(&ip);
     }
 }
-
 
 /// Extract source IP address from IP packet data.
 ///
