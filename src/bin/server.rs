@@ -26,8 +26,10 @@
 //! 4. Server forwards packets based on destination IP
 //! 5. Client disconnects -> IP removed from registry
 
+use base64::Engine;
 use rusttun::shared::config::ServerConfig;
 use rusttun::shared::data::FrameType;
+use rusttun::shared::stats::TrafficStats;
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::Ipv4Addr;
@@ -83,6 +85,7 @@ async fn main() {
                 secret: "ttt".to_string(),
                 heartbeat_interval_secs: 10,
                 client_timeout_secs: 30,
+                stats: Default::default(),
             }
         }
     };
@@ -94,6 +97,22 @@ async fn main() {
     // Step 3: Initialize client registry (shared across all connections)
     let clients: ClientRegistry = Arc::new(Mutex::new(HashMap::new()));
     let secret = config.secret.clone();
+    let stats = Arc::new(TrafficStats::default());
+
+    if config.stats.enabled {
+        match validate_stats_config(&config.stats) {
+            Ok(()) => {
+                let stats_config = config.stats.clone();
+                let stats_clone = stats.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = run_stats_server(stats_config, stats_clone).await {
+                        eprintln!("Stats server stopped: {}", e);
+                    }
+                });
+            }
+            Err(message) => eprintln!("Stats server disabled: {}", message),
+        }
+    }
 
     // Step 4: Start TCP listener and accept connections
     match TcpListener::bind(&bind_addr).await {
@@ -109,10 +128,16 @@ async fn main() {
                     // Clone references for the new client task
                     let clients_clone = clients.clone();
                     let secret_clone = secret.clone();
+                    let stats_clone = stats.clone();
 
                     // Spawn async handler for this client
                     // WHY: Each client gets its own task - they run concurrently
-                    tokio::spawn(on_client_accepted(socket, clients_clone, secret_clone));
+                    tokio::spawn(on_client_accepted(
+                        socket,
+                        clients_clone,
+                        secret_clone,
+                        stats_clone,
+                    ));
                 }
                 Result::Err(_) => {
                     // Log error but continue accepting other clients
@@ -137,7 +162,12 @@ async fn main() {
 /// 2. Split socket into read and write halves
 /// 3. Wrap writer in Arc<Mutex> for shared access
 /// 4. Start the read loop
-async fn on_client_accepted(socket: TcpStream, clients: ClientRegistry, secret: String) {
+async fn on_client_accepted(
+    socket: TcpStream,
+    clients: ClientRegistry,
+    secret: String,
+    stats: Arc<TrafficStats>,
+) {
     // Log client connection for debugging
     let addr = socket.peer_addr().unwrap();
     println!("Client connected: {}", addr);
@@ -149,9 +179,10 @@ async fn on_client_accepted(socket: TcpStream, clients: ClientRegistry, secret: 
     // Wrap writer in Mutex for shared access (registry holds this)
     // WHY: The registry is shared, so the writer needs to be thread-safe
     let writer_arc = Arc::new(Mutex::new(w));
+    stats.record_connection_opened();
 
     // Start reading frames from this client
-    read_loop(r, writer_arc, clients, secret).await
+    read_loop(r, writer_arc, clients, secret, stats).await
 }
 
 /// Main read loop for processing client frames.
@@ -172,6 +203,7 @@ async fn read_loop(
     writer: Arc<Mutex<OwnedWriteHalf>>,
     clients: ClientRegistry,
     secret: String,
+    stats: Arc<TrafficStats>,
 ) {
     // Wrap in BufReader for efficient reading
     // WHY: Reduces syscalls by buffering data internally
@@ -196,15 +228,18 @@ async fn read_loop(
             Ok(n) => {
                 // Add new data to buffer
                 buffer.extend_from_slice(&tmp_buffer[..n]);
+                stats.record_bytes_received(n);
 
                 // Security: prevent buffer overflow attacks
                 if buffer.len() > MAX_BUFFER_SIZE {
                     buffer.clear();
+                    stats.record_parse_error();
                     break;
                 }
             }
             Err(_) => {
                 // Read error - terminate connection
+                stats.record_read_error();
                 break;
             }
         }
@@ -219,6 +254,8 @@ async fn read_loop(
                     // Handle frame based on type
                     match frame.kind {
                         FrameType::Heartbeat => {
+                            stats.record_heartbeat_frame();
+
                             // Registration frame - extract client IP
                             if let Some(reg_ip) = frame.get_heartbeat_ip() {
                                 let client_ip_addr = Ipv4Addr::from_bits(reg_ip);
@@ -233,10 +270,13 @@ async fn read_loop(
                                             writer: writer.clone(),
                                         },
                                     );
+                                    stats.set_registered_clients(client_map.len());
                                 }
                             }
                         }
                         FrameType::Data => {
+                            stats.record_data_frame();
+
                             // Data frame - forward to destination client
 
                             // First data frame may carry registration IP too
@@ -252,6 +292,7 @@ async fn read_loop(
                                         writer: writer.clone(),
                                     },
                                 );
+                                stats.set_registered_clients(client_map.len());
                             }
 
                             // Route packet to destination client based on dst IP
@@ -264,8 +305,15 @@ async fn read_loop(
                                 if let Some(client_info) = client_map.get(&dst) {
                                     // Forward the packet
                                     let mut writer = client_info.writer.lock().await;
-                                    let _ = writer.write_all(&frame_bytes).await;
+                                    match writer.write_all(&frame_bytes).await {
+                                        Ok(()) => stats.record_forwarded_frame(frame_bytes.len()),
+                                        Err(_) => stats.record_write_error(),
+                                    }
+                                } else {
+                                    stats.record_dropped_frame();
                                 }
+                            } else {
+                                stats.record_dropped_frame();
                             }
                         }
                     }
@@ -277,6 +325,7 @@ async fn read_loop(
                         break;
                     }
                     // Invalid frame - clear buffer and terminate
+                    stats.record_parse_error();
                     buffer.clear();
                     break;
                 }
@@ -286,9 +335,221 @@ async fn read_loop(
 
     // Cleanup: remove client from registry on disconnect
     if let Some(ip) = client_ip {
-        clients.lock().await.remove(&ip);
+        let mut client_map = clients.lock().await;
+        client_map.remove(&ip);
+        stats.set_registered_clients(client_map.len());
+    }
+
+    stats.record_connection_closed();
+}
+
+/// Run the HTTP statistics API and dashboard.
+async fn run_stats_server(
+    config: rusttun::shared::config::StatsConfig,
+    stats: Arc<TrafficStats>,
+) -> Result<()> {
+    let bind_addr = format!("{}:{}", config.bind_addr, config.bind_port);
+    let listener = TcpListener::bind(&bind_addr).await?;
+    println!("Stats dashboard listening on http://{}", bind_addr);
+
+    let username = config.username.as_deref().unwrap_or_default();
+    let password = config.password.as_deref().unwrap_or_default();
+    let expected_auth = build_basic_auth_header(username, password);
+
+    loop {
+        let (socket, _) = listener.accept().await?;
+        let stats_clone = stats.clone();
+        let expected_auth_clone = expected_auth.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) = handle_stats_connection(socket, stats_clone, expected_auth_clone).await
+            {
+                eprintln!("Stats request failed: {}", e);
+            }
+        });
     }
 }
+
+/// Validate that enabled stats configuration is safe enough to start.
+fn validate_stats_config(
+    config: &rusttun::shared::config::StatsConfig,
+) -> std::result::Result<(), &'static str> {
+    if config.username.as_deref().is_none_or(str::is_empty) {
+        return Err("[stats].username must be set when stats are enabled");
+    }
+
+    if config.password.as_deref().is_none_or(str::is_empty) {
+        return Err("[stats].password must be set when stats are enabled");
+    }
+
+    Ok(())
+}
+
+/// Handle one HTTP request for the stats API or dashboard.
+async fn handle_stats_connection(
+    socket: TcpStream,
+    stats: Arc<TrafficStats>,
+    expected_auth: String,
+) -> Result<()> {
+    let mut reader = BufReader::new(socket);
+    let mut request = Vec::with_capacity(4096);
+    let mut tmp_buffer = [0u8; 1024];
+
+    loop {
+        let n = reader.read(&mut tmp_buffer).await?;
+        if n == 0 {
+            return Ok(());
+        }
+
+        request.extend_from_slice(&tmp_buffer[..n]);
+        if request.windows(4).any(|window| window == b"\r\n\r\n") || request.len() >= 8192 {
+            break;
+        }
+    }
+
+    let response = build_stats_response(&request, &stats, &expected_auth);
+    let stream = reader.get_mut();
+    stream.write_all(response.as_bytes()).await?;
+    stream.shutdown().await
+}
+
+/// Build a complete HTTP response for a raw stats HTTP request.
+fn build_stats_response(request: &[u8], stats: &TrafficStats, expected_auth: &str) -> String {
+    let Ok(request_text) = std::str::from_utf8(request) else {
+        return http_response(
+            "400 Bad Request",
+            "text/plain; charset=utf-8",
+            "Bad request",
+        );
+    };
+
+    if !is_authorized(request_text, expected_auth) {
+        return unauthorized_response();
+    }
+
+    let path = request_text
+        .lines()
+        .next()
+        .and_then(|request_line| request_line.split_whitespace().nth(1))
+        .unwrap_or("/");
+
+    match path {
+        "/" | "/dashboard" => http_response("200 OK", "text/html; charset=utf-8", DASHBOARD_HTML),
+        "/api/stats" | "/stats" => match serde_json::to_string_pretty(&stats.snapshot()) {
+            Ok(body) => http_response("200 OK", "application/json; charset=utf-8", &body),
+            Err(_) => http_response(
+                "500 Internal Server Error",
+                "text/plain; charset=utf-8",
+                "Failed to serialize stats",
+            ),
+        },
+        _ => http_response("404 Not Found", "text/plain; charset=utf-8", "Not found"),
+    }
+}
+
+/// Check whether an HTTP request contains the expected Basic Auth header.
+fn is_authorized(request_text: &str, expected_auth: &str) -> bool {
+    request_text.lines().any(|line| {
+        let Some((name, value)) = line.split_once(':') else {
+            return false;
+        };
+
+        name.eq_ignore_ascii_case("authorization") && value.trim() == expected_auth
+    })
+}
+
+/// Return the expected HTTP Basic Auth header value.
+fn build_basic_auth_header(username: &str, password: &str) -> String {
+    let token =
+        base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", username, password));
+    format!("Basic {}", token)
+}
+
+/// Build an HTTP 401 response with the Basic Auth challenge header.
+fn unauthorized_response() -> String {
+    let body = "Authentication required";
+    format!(
+        "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"rs-tun stats\"\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body,
+    )
+}
+
+/// Build a simple HTTP response.
+fn http_response(status: &str, content_type: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        status,
+        content_type,
+        body.len(),
+        body,
+    )
+}
+
+const DASHBOARD_HTML: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>rs-tun Traffic Stats</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem; background: #0f172a; color: #e2e8f0; }
+    h1 { margin-bottom: 0.25rem; }
+    .muted { color: #94a3b8; margin-bottom: 1.5rem; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; }
+    .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 1rem; }
+    .label { color: #94a3b8; font-size: 0.9rem; }
+    .value { font-size: 1.8rem; font-weight: 700; margin-top: 0.25rem; }
+    .error { color: #fca5a5; }
+  </style>
+</head>
+<body>
+  <h1>rs-tun Traffic Stats</h1>
+  <div class="muted">Auto-refreshes every 2 seconds. JSON API: <code>/api/stats</code></div>
+  <div id="status" class="muted">Loading...</div>
+  <div id="stats" class="grid"></div>
+  <script>
+    const labels = {
+      current_connections: 'Current Connections',
+      total_connections: 'Total Connections',
+      registered_clients: 'Registered Clients',
+      bytes_received: 'Bytes Received',
+      frames_received: 'Frames Received',
+      heartbeat_frames: 'Heartbeat Frames',
+      data_frames: 'Data Frames',
+      bytes_forwarded: 'Bytes Forwarded',
+      frames_forwarded: 'Frames Forwarded',
+      frames_dropped: 'Frames Dropped',
+      parse_errors: 'Parse Errors',
+      read_errors: 'Read Errors',
+      write_errors: 'Write Errors'
+    };
+
+    function render(stats) {
+      document.getElementById('status').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
+      document.getElementById('stats').innerHTML = Object.entries(labels).map(([key, label]) => `
+        <div class="card">
+          <div class="label">${label}</div>
+          <div class="value">${Number(stats[key] ?? 0).toLocaleString()}</div>
+        </div>
+      `).join('');
+    }
+
+    async function refresh() {
+      try {
+        const response = await fetch('/api/stats');
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        render(await response.json());
+      } catch (error) {
+        document.getElementById('status').innerHTML = '<span class="error">Failed to load stats: ' + error.message + '</span>';
+      }
+    }
+
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>"#;
 
 /// Extract source IP address from IP packet data.
 ///

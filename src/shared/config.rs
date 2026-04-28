@@ -47,6 +47,7 @@ pub enum ConfigError {
 /// - `secret`: Secret token for heartbeat authentication
 /// - `heartbeat_interval_secs`: Interval between heartbeat checks (default: 10)
 /// - `client_timeout_secs`: Client disconnection timeout (default: 30)
+/// - `stats`: HTTP statistics API and dashboard configuration
 ///
 /// # Usage
 /// Load from TOML file using `load()` or `load_from_current_dir()`.
@@ -84,6 +85,44 @@ pub struct ServerConfig {
     /// If no heartbeat received within this time, client is removed.
     #[serde(default = "default_client_timeout_secs")]
     pub client_timeout_secs: u64,
+
+    /// HTTP statistics API and dashboard configuration.
+    #[serde(default)]
+    pub stats: StatsConfig,
+}
+
+/// HTTP statistics API and dashboard configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StatsConfig {
+    /// Whether the stats HTTP server should be started.
+    #[serde(default = "default_stats_enabled")]
+    pub enabled: bool,
+
+    /// Address to bind the stats HTTP server.
+    #[serde(default = "default_stats_bind_addr")]
+    pub bind_addr: String,
+
+    /// Port to bind the stats HTTP server.
+    #[serde(default = "default_stats_bind_port")]
+    pub bind_port: u16,
+
+    /// HTTP Basic Auth username for the stats API and dashboard.
+    pub username: Option<String>,
+
+    /// HTTP Basic Auth password for the stats API and dashboard.
+    pub password: Option<String>,
+}
+
+impl Default for StatsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_stats_enabled(),
+            bind_addr: default_stats_bind_addr(),
+            bind_port: default_stats_bind_port(),
+            username: None,
+            password: None,
+        }
+    }
 }
 
 /// Default heartbeat interval: 10 seconds.
@@ -100,6 +139,21 @@ fn default_heartbeat_interval_secs() -> u64 {
 /// interval, gives 3x margin for heartbeat delays.
 fn default_client_timeout_secs() -> u64 {
     30
+}
+
+/// Default stats server enabled flag.
+fn default_stats_enabled() -> bool {
+    false
+}
+
+/// Default stats bind address.
+fn default_stats_bind_addr() -> String {
+    "127.0.0.1".to_string()
+}
+
+/// Default stats bind port.
+fn default_stats_bind_port() -> u16 {
+    20265
 }
 
 impl ServerConfig {
@@ -287,6 +341,33 @@ mod tests {
         assert_eq!(config.bind_addr, "0.0.0.0");
         assert_eq!(config.bind_port, 20264);
         assert_eq!(config.heartbeat_interval_secs, 10);
+        assert!(!config.stats.enabled);
+        assert_eq!(config.stats.username, None);
+        assert_eq!(config.stats.password, None);
+    }
+
+    #[test]
+    fn test_server_stats_config_loads_explicit_credentials() {
+        let toml_str = r#"
+            bind_addr = "0.0.0.0"
+            bind_port = 20264
+            secret = "mysecret"
+
+            [stats]
+            enabled = true
+            bind_addr = "127.0.0.1"
+            bind_port = 20265
+            username = "stats-user"
+            password = "stats-password"
+        "#;
+
+        let config: ServerConfig = toml::from_str(toml_str).unwrap();
+
+        assert!(config.stats.enabled);
+        assert_eq!(config.stats.bind_addr, "127.0.0.1");
+        assert_eq!(config.stats.bind_port, 20265);
+        assert_eq!(config.stats.username.as_deref(), Some("stats-user"));
+        assert_eq!(config.stats.password.as_deref(), Some("stats-password"));
     }
 
     // Test: Client config loads with defaults

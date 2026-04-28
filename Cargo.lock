@@ -1168,6 +1168,7 @@ dependencies = [
 name = "rusttun"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bytes",
  "crc32fast",
  "hex",
@@ -1177,6 +1178,7 @@ dependencies = [
  "rand 0.10.0",
  "rcgen",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "time",
  "tokio",

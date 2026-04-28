@@ -103,7 +103,24 @@ heartbeat_interval_secs = 10
 
 # Client timeout (seconds) - client removed if no heartbeat within this time
 client_timeout_secs = 30
+
+# Optional traffic statistics HTTP API and dashboard
+[stats]
+enabled = true
+bind_addr = "127.0.0.1"
+bind_port = 20265
+username = "admin"
+password = "change-me"
 ```
+
+When `[stats]` is enabled, the server exposes:
+
+- `GET /` - simple HTML traffic statistics dashboard
+- `GET /api/stats` - JSON traffic statistics snapshot
+
+Both endpoints require HTTP Basic Auth using the configured `username` and `password`. These
+credentials must be set explicitly when `enabled = true`; the stats server will not start with
+missing or empty credentials.
 
 ### Client Config (`client.toml`)
 
