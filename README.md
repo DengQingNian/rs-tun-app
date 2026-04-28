@@ -115,12 +115,18 @@ password = "change-me"
 
 When `[stats]` is enabled, the server exposes:
 
-- `GET /` - simple HTML traffic statistics dashboard
-- `GET /api/stats` - JSON traffic statistics snapshot
+- `GET /` - HTML traffic statistics dashboard with summary cards, a recent traffic chart,
+  and an active connection table
+- `GET /api/stats` - JSON traffic statistics snapshot, including per-connection traffic,
+  online duration, traffic share, and recent traffic samples
 
 Both endpoints require HTTP Basic Auth using the configured `username` and `password`. These
 credentials must be set explicitly when `enabled = true`; the stats server will not start with
 missing or empty credentials.
+
+The dashboard lists each registered client connection with its virtual IP, TCP peer address,
+received/forwarded traffic, frame counts, traffic share, and online time. The traffic chart uses
+the latest rolling per-second samples to show received and forwarded bytes over the last minute.
 
 ### Client Config (`client.toml`)
 

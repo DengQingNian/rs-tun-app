@@ -32,8 +32,9 @@ use rusttun::shared::data::FrameType;
 use rusttun::shared::stats::TrafficStats;
 use std::collections::HashMap;
 use std::io::ErrorKind;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, Result};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
@@ -51,8 +52,19 @@ const MAX_BUFFER_SIZE: usize = 1024 * 1024;
 /// WHY: We need to track the writer handle for each registered client IP.
 /// This allows sending frames to that client when packets arrive for them.
 struct ClientInfo {
+    /// Unique TCP connection identifier that owns this registry slot.
+    connection_id: u64,
+
     /// Write half of the TCP connection for sending frames to client.
     writer: Arc<Mutex<OwnedWriteHalf>>,
+}
+
+/// State tracked while one TCP connection is being read.
+struct ConnectionContext {
+    id: u64,
+    ip: Option<Ipv4Addr>,
+    peer_addr: SocketAddr,
+    pending_received_bytes: u64,
 }
 
 /// Type alias for the client registry.
@@ -60,6 +72,8 @@ struct ClientInfo {
 /// WHY: The registry maps a client's TUN IP address to their connection metadata.
 /// This enables O(1) lookup for packet routing.
 type ClientRegistry = Arc<Mutex<HashMap<Ipv4Addr, ClientInfo>>>;
+
+static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Server entry point.
 ///
@@ -97,7 +111,7 @@ async fn main() {
     // Step 3: Initialize client registry (shared across all connections)
     let clients: ClientRegistry = Arc::new(Mutex::new(HashMap::new()));
     let secret = config.secret.clone();
-    let stats = Arc::new(TrafficStats::default());
+    let stats = Arc::new(TrafficStats::new());
 
     if config.stats.enabled {
         match validate_stats_config(&config.stats) {
@@ -169,12 +183,15 @@ async fn on_client_accepted(
     stats: Arc<TrafficStats>,
 ) {
     // Log client connection for debugging
-    let addr = socket.peer_addr().unwrap();
+    let addr = socket
+        .peer_addr()
+        .expect("accepted socket has peer address");
     println!("Client connected: {}", addr);
 
     // Split into read and write halves
     // WHY: We need independent access to read and write - they're used in different contexts
     let (r, w) = socket.into_split();
+    let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
 
     // Wrap writer in Mutex for shared access (registry holds this)
     // WHY: The registry is shared, so the writer needs to be thread-safe
@@ -182,7 +199,7 @@ async fn on_client_accepted(
     stats.record_connection_opened();
 
     // Start reading frames from this client
-    read_loop(r, writer_arc, clients, secret, stats).await
+    read_loop(r, writer_arc, clients, secret, stats, addr, connection_id).await
 }
 
 /// Main read loop for processing client frames.
@@ -204,6 +221,8 @@ async fn read_loop(
     clients: ClientRegistry,
     secret: String,
     stats: Arc<TrafficStats>,
+    peer_addr: SocketAddr,
+    connection_id: u64,
 ) {
     // Wrap in BufReader for efficient reading
     // WHY: Reduces syscalls by buffering data internally
@@ -214,7 +233,12 @@ async fn read_loop(
     let mut buffer = Vec::with_capacity(65536);
 
     // Track this client's registered IP
-    let mut client_ip: Option<Ipv4Addr> = None;
+    let mut connection = ConnectionContext {
+        id: connection_id,
+        ip: None,
+        peer_addr,
+        pending_received_bytes: 0,
+    };
 
     // Main read loop - runs until connection closes or error
     loop {
@@ -229,6 +253,11 @@ async fn read_loop(
                 // Add new data to buffer
                 buffer.extend_from_slice(&tmp_buffer[..n]);
                 stats.record_bytes_received(n);
+                if let Some(ip) = connection.ip {
+                    stats.record_connection_bytes_received(ip, n);
+                } else {
+                    connection.pending_received_bytes += n as u64;
+                }
 
                 // Security: prevent buffer overflow attacks
                 if buffer.len() > MAX_BUFFER_SIZE {
@@ -261,17 +290,14 @@ async fn read_loop(
                                 let client_ip_addr = Ipv4Addr::from_bits(reg_ip);
 
                                 // First heartbeat from this client - register them
-                                if client_ip.is_none() {
-                                    client_ip = Some(client_ip_addr);
-                                    let mut client_map = clients.lock().await;
-                                    client_map.insert(
-                                        client_ip_addr,
-                                        ClientInfo {
-                                            writer: writer.clone(),
-                                        },
-                                    );
-                                    stats.set_registered_clients(client_map.len());
-                                }
+                                register_client_if_needed(
+                                    &mut connection,
+                                    client_ip_addr,
+                                    writer.clone(),
+                                    &clients,
+                                    &stats,
+                                )
+                                .await;
                             }
                         }
                         FrameType::Data => {
@@ -281,18 +307,21 @@ async fn read_loop(
 
                             // First data frame may carry registration IP too
                             // HOW: Extract source IP from IP packet header
-                            if client_ip.is_none()
+                            if connection.ip.is_none()
                                 && let Some(src_ip) = extract_src_ip(&frame.data)
                             {
-                                client_ip = Some(src_ip);
-                                let mut client_map = clients.lock().await;
-                                client_map.insert(
+                                register_client_if_needed(
+                                    &mut connection,
                                     src_ip,
-                                    ClientInfo {
-                                        writer: writer.clone(),
-                                    },
-                                );
-                                stats.set_registered_clients(client_map.len());
+                                    writer.clone(),
+                                    &clients,
+                                    &stats,
+                                )
+                                .await;
+                            }
+
+                            if let Some(ip) = connection.ip {
+                                stats.record_connection_data_frame(ip);
                             }
 
                             // Route packet to destination client based on dst IP
@@ -301,12 +330,24 @@ async fn read_loop(
                                 let frame_bytes = frame.to_bytes();
 
                                 // Lookup destination client in registry
-                                let client_map = clients.lock().await;
-                                if let Some(client_info) = client_map.get(&dst) {
+                                let destination_writer = {
+                                    let client_map = clients.lock().await;
+                                    client_map
+                                        .get(&dst)
+                                        .map(|client_info| client_info.writer.clone())
+                                };
+
+                                if let Some(destination_writer) = destination_writer {
                                     // Forward the packet
-                                    let mut writer = client_info.writer.lock().await;
+                                    let mut writer = destination_writer.lock().await;
                                     match writer.write_all(&frame_bytes).await {
-                                        Ok(()) => stats.record_forwarded_frame(frame_bytes.len()),
+                                        Ok(()) => {
+                                            stats.record_forwarded_frame(frame_bytes.len());
+                                            stats.record_connection_forwarded_frame(
+                                                dst,
+                                                frame_bytes.len(),
+                                            );
+                                        }
                                         Err(_) => stats.record_write_error(),
                                     }
                                 } else {
@@ -334,13 +375,49 @@ async fn read_loop(
     }
 
     // Cleanup: remove client from registry on disconnect
-    if let Some(ip) = client_ip {
+    if let Some(ip) = connection.ip {
         let mut client_map = clients.lock().await;
-        client_map.remove(&ip);
-        stats.set_registered_clients(client_map.len());
+        let owns_registry_slot = client_map
+            .get(&ip)
+            .is_some_and(|client_info| client_info.connection_id == connection.id);
+        if owns_registry_slot {
+            client_map.remove(&ip);
+            stats.set_registered_clients(client_map.len());
+            stats.unregister_connection(ip, connection.id);
+        }
     }
 
     stats.record_connection_closed();
+}
+
+/// Register the client IP once and attach any bytes read before registration.
+async fn register_client_if_needed(
+    connection: &mut ConnectionContext,
+    ip: Ipv4Addr,
+    writer: Arc<Mutex<OwnedWriteHalf>>,
+    clients: &ClientRegistry,
+    stats: &TrafficStats,
+) {
+    if connection.ip.is_some() {
+        return;
+    }
+
+    connection.ip = Some(ip);
+    let mut client_map = clients.lock().await;
+    client_map.insert(
+        ip,
+        ClientInfo {
+            connection_id: connection.id,
+            writer,
+        },
+    );
+    stats.set_registered_clients(client_map.len());
+    stats.register_connection(ip, connection.id, &connection.peer_addr.to_string());
+
+    if connection.pending_received_bytes > 0 {
+        stats.record_connection_bytes_received(ip, connection.pending_received_bytes as usize);
+        connection.pending_received_bytes = 0;
+    }
 }
 
 /// Run the HTTP statistics API and dashboard.
@@ -495,11 +572,19 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
   <style>
     body { font-family: system-ui, sans-serif; margin: 2rem; background: #0f172a; color: #e2e8f0; }
     h1 { margin-bottom: 0.25rem; }
+    h2 { margin-top: 2rem; }
     .muted { color: #94a3b8; margin-bottom: 1.5rem; }
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; }
-    .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 1rem; }
+    .card, .panel { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 1rem; }
     .label { color: #94a3b8; font-size: 0.9rem; }
     .value { font-size: 1.8rem; font-weight: 700; margin-top: 0.25rem; }
+    canvas { width: 100%; height: 260px; background: #0f172a; border-radius: 8px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 0.65rem; border-bottom: 1px solid #334155; text-align: left; }
+    th { color: #94a3b8; font-size: 0.85rem; font-weight: 600; }
+    .bar { height: 0.5rem; background: #334155; border-radius: 999px; overflow: hidden; min-width: 80px; }
+    .bar > span { display: block; height: 100%; background: linear-gradient(90deg, #22c55e, #38bdf8); }
+    .empty { color: #94a3b8; padding: 1rem 0; }
     .error { color: #fca5a5; }
   </style>
 </head>
@@ -508,8 +593,13 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
   <div class="muted">Auto-refreshes every 2 seconds. JSON API: <code>/api/stats</code></div>
   <div id="status" class="muted">Loading...</div>
   <div id="stats" class="grid"></div>
+  <h2>Traffic Chart</h2>
+  <div class="panel"><canvas id="traffic-chart" width="1000" height="260"></canvas></div>
+  <h2>Active Connections</h2>
+  <div id="connections" class="panel"></div>
   <script>
     const labels = {
+      uptime_secs: 'Server Uptime',
       current_connections: 'Current Connections',
       total_connections: 'Total Connections',
       registered_clients: 'Registered Clients',
@@ -525,14 +615,131 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       write_errors: 'Write Errors'
     };
 
+    function formatBytes(bytes) {
+      const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+      let value = Number(bytes ?? 0);
+      let unit = 0;
+      while (value >= 1024 && unit < units.length - 1) {
+        value /= 1024;
+        unit += 1;
+      }
+      return value.toLocaleString(undefined, { maximumFractionDigits: unit === 0 ? 0 : 1 }) + ' ' + units[unit];
+    }
+
+    function formatDuration(seconds) {
+      let remaining = Number(seconds ?? 0);
+      const hours = Math.floor(remaining / 3600);
+      remaining %= 3600;
+      const minutes = Math.floor(remaining / 60);
+      const secs = remaining % 60;
+      return [hours, minutes, secs].map(value => String(value).padStart(2, '0')).join(':');
+    }
+
     function render(stats) {
       document.getElementById('status').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
       document.getElementById('stats').innerHTML = Object.entries(labels).map(([key, label]) => `
         <div class="card">
           <div class="label">${label}</div>
-          <div class="value">${Number(stats[key] ?? 0).toLocaleString()}</div>
+          <div class="value">${key.includes('bytes') ? formatBytes(stats[key]) : key.includes('uptime') ? formatDuration(stats[key]) : Number(stats[key] ?? 0).toLocaleString()}</div>
         </div>
       `).join('');
+      renderConnections(stats.connections ?? []);
+      renderTrafficChart(stats.traffic_series ?? []);
+    }
+
+    function renderConnections(connections) {
+      if (connections.length === 0) {
+        document.getElementById('connections').innerHTML = '<div class="empty">No registered connections yet.</div>';
+        return;
+      }
+
+      document.getElementById('connections').innerHTML = `
+        <table>
+          <thead>
+            <tr>
+              <th>Client IP</th>
+              <th>Peer</th>
+              <th>Online</th>
+              <th>Received</th>
+              <th>Forwarded</th>
+              <th>Frames RX/TX</th>
+              <th>Traffic Share</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${connections.map(connection => `
+              <tr>
+                <td>${connection.ip}</td>
+                <td>${connection.peer_addr}</td>
+                <td>${formatDuration(connection.online_secs)}</td>
+                <td>${formatBytes(connection.bytes_received)}</td>
+                <td>${formatBytes(connection.bytes_forwarded)}</td>
+                <td>${Number(connection.frames_received).toLocaleString()} / ${Number(connection.frames_forwarded).toLocaleString()}</td>
+                <td>
+                  <div>${Number(connection.traffic_share_percent).toFixed(1)}%</div>
+                  <div class="bar"><span style="width: ${Math.min(100, connection.traffic_share_percent)}%"></span></div>
+                </td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      `;
+    }
+
+    function renderTrafficChart(series) {
+      const canvas = document.getElementById('traffic-chart');
+      const ctx = canvas.getContext('2d');
+      const width = canvas.width;
+      const height = canvas.height;
+      ctx.clearRect(0, 0, width, height);
+      ctx.fillStyle = '#0f172a';
+      ctx.fillRect(0, 0, width, height);
+
+      const padding = 34;
+      const points = series.slice(-60);
+      if (points.length === 0) {
+        ctx.fillStyle = '#94a3b8';
+        ctx.fillText('Waiting for traffic samples...', padding, height / 2);
+        return;
+      }
+
+      const maxValue = Math.max(1, ...points.map(point => Math.max(point.bytes_received, point.bytes_forwarded)));
+      drawAxis(ctx, width, height, padding, maxValue);
+      drawLine(ctx, points, 'bytes_received', '#38bdf8', maxValue, width, height, padding);
+      drawLine(ctx, points, 'bytes_forwarded', '#22c55e', maxValue, width, height, padding);
+
+      ctx.fillStyle = '#38bdf8';
+      ctx.fillText('Received', width - 170, 24);
+      ctx.fillStyle = '#22c55e';
+      ctx.fillText('Forwarded', width - 90, 24);
+    }
+
+    function drawAxis(ctx, width, height, padding, maxValue) {
+      ctx.strokeStyle = '#334155';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(padding, padding);
+      ctx.lineTo(padding, height - padding);
+      ctx.lineTo(width - padding, height - padding);
+      ctx.stroke();
+      ctx.fillStyle = '#94a3b8';
+      ctx.fillText(formatBytes(maxValue) + '/s', padding + 6, padding + 4);
+      ctx.fillText('last 60s', width - 90, height - 10);
+    }
+
+    function drawLine(ctx, points, key, color, maxValue, width, height, padding) {
+      const chartWidth = width - padding * 2;
+      const chartHeight = height - padding * 2;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      points.forEach((point, index) => {
+        const x = padding + (points.length === 1 ? chartWidth : (chartWidth * index) / (points.length - 1));
+        const y = height - padding - (Number(point[key] ?? 0) / maxValue) * chartHeight;
+        if (index === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
     }
 
     async function refresh() {
